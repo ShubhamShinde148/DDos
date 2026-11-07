@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import random
 import ssl
+import sys
 import time
 from dataclasses import dataclass, field
 
 from .adaptive import AdaptiveController
 from .h2 import H2Connection
+from .httpresp import TruncatedBody, read_response
 from .metrics import Metrics
 from .payloads import PayloadStrategy
 from .proxypool import Proxy, ProxyPool
 from .scope import Target
 from .socks import SocksError, socks5_connect
+
+DEBUG = os.environ.get("LOADLAB_DEBUG", "").lower() in ("1", "true", "yes")
+_DEFAULT_TIMEOUT = 8.0
 
 
 @dataclass
@@ -198,38 +204,33 @@ class HttpFlooder:
         line = f"{p.method} {path} HTTP/1.1\r\n{hdr}\r\n".encode()
         return line + body, use_headers.get("Connection") == "close"
 
-    async def _one_request(self, writer, reader) -> tuple[bool, int]:
-        request, close_after = self._build_request()
+    async def _one_request(self, writer, reader) -> tuple[bool, int, bool]:
+        """Send one request, read exactly one response.
+
+        Returns (success, status, reusable). `reusable` reflects the *server's*
+        decision to keep the connection open, so the worker stops writing into
+        a socket the peer has already closed.
+        """
+        request, _ = self._build_request()
         start = time.perf_counter()
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout=self.timeout)
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=self.timeout)
 
-        first = head.split(b"\r\n", 1)[0]
         try:
-            status = int(first.split(b" ", 2)[1])
-        except (IndexError, ValueError):
-            status = 0
-        size = len(head)
-        clen = 0
-        for line in head.split(b"\r\n")[1:]:
-            low = line.lower()
-            if low.startswith(b"content-length:"):
-                try:
-                    clen = int(line.split(b":", 1)[1].strip())
-                except ValueError:
-                    clen = 0
-                break
-        if clen:
-            remaining = min(clen, 1 << 20)
-            while remaining > 0:
-                chunk = await asyncio.wait_for(reader.read(min(remaining, 65536)), timeout=self.timeout)
-                if not chunk:
-                    break
-                size += len(chunk)
-                remaining -= len(chunk)
-        self.metrics.record(status, time.perf_counter() - start, size)
-        return True, status
+            resp = await read_response(reader, self.profile.method, self.timeout)
+        except TruncatedBody as exc:
+            self.metrics.record_error("TruncatedBody", time.perf_counter() - start)
+            if DEBUG:
+                print(f"[loadlab] truncated body on {self.target.netloc}: "
+                      f"{exc.declared} declared, {exc.received} received", file=sys.stderr)
+            return False, 0, False
+
+        self.metrics.record(resp.status, time.perf_counter() - start, resp.total_bytes)
+        if DEBUG:
+            reuse = "reuse" if resp.keep_alive else "close"
+            print(f"[loadlab] {resp.version} {resp.status} "
+                  f"{len(resp.body)}B hdr={resp.header_bytes}B {reuse}", file=sys.stderr)
+        return True, resp.status, resp.keep_alive
 
     async def _one_request_h2(self, conn, reader, writer) -> tuple[bool, int]:
         p = self.profile
@@ -282,8 +283,9 @@ class HttpFlooder:
                     h2conn = H2Connection(reader, writer)
                     await h2conn.handshake()
 
+                reusable = True
                 for _ in range(self.per_conn_requests):
-                    if stop.is_set() or self._stop.is_set():
+                    if stop.is_set() or self._stop.is_set() or not reusable:
                         break
                     await self.limiter.acquire()
                     if self.adaptive is not None:
@@ -298,7 +300,9 @@ class HttpFlooder:
                                     if not ok:
                                         break
                                 else:
-                                    ok, _ = await self._one_request(writer, reader)
+                                    ok, _, reusable = await self._one_request(writer, reader)
+                                    if not ok:
+                                        break
                                 break
                             except (ConnectionError, OSError) as exc:
                                 attempt += 1

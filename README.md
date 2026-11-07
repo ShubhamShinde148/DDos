@@ -141,6 +141,7 @@ Reports land in `reports/`:
 loadlab.py                entry point
 internal/scope.py         allowlist enforcement, DNS pre-resolution
 internal/httpflood.py     asyncio engine: keep-alive, proxy tunnel, retries
+internal/httpresp.py      HTTP/1.x response parsing, framing, keep-alive decision
 internal/scenario.py      stage director, ramp/spike profiles
 internal/adaptive.py      AIMD congestion controller
 internal/proxypool.py     proxy parsing, scoring, rotation, cooldown
@@ -151,6 +152,7 @@ internal/packetrain.py    threaded TCP/UDP generator
 internal/metrics.py       1s buckets, percentiles, ANSI dashboard
 internal/report.py        JSON / CSV writers
 internal/cli.py           argparse front end
+tests/test_httpresp.py    protocol tests against real loopback sockets
 ```
 
 ## Native HTTP/2
@@ -180,6 +182,29 @@ socks5://1.2.3.4:1080
 ```
 
 TLS is layered inside the tunnel via `start_tls`, so HTTPS through SOCKS5 works.
+
+## Debugging
+
+Set `LOADLAB_DEBUG=1` to trace each response to stderr:
+
+```
+[loadlab] HTTP/1.0 200 7890B hdr=147B close
+```
+
+Shows protocol version, status, body size, header size, and whether the
+connection was reused or closed. Useful when a target behaves differently from
+what you expect.
+
+## Tests
+
+```
+python -m pytest tests -v
+```
+
+19 protocol tests run against throwaway servers bound to 127.0.0.1: status
+codes, empty and large bodies, truncation, chunked framing with trailers,
+malformed framing, HTTP/1.0 keep-alive opt-in, read-until-close, timeouts, and
+sequential responses on a single connection.
 
 ## Notes
 
