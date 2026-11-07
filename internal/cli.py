@@ -25,7 +25,7 @@ BANNER = r"""
 | |/ _ \ / _` |/ _` | |/ _` |/ _` |
 | | (_) | (_| | (_| | | (_| | (_| |
 |_|\___/ \__,_|\__,_|_|\__,_|\__,_|
-   load and packet-rate harness   v1.2
+   load and packet-rate harness   v1.3
 """
 
 
@@ -88,8 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=[PayloadStrategy.BROWSER, PayloadStrategy.JSON,
                             PayloadStrategy.FORM, PayloadStrategy.RANDOM],
                    help="per-request body/header strategy")
-    h.add_argument("--no-cookies", action="store_true", help="omit random Cookie header")
-    h.add_argument("--no-buster", action="store_true", help="omit cache-buster query params")
+    h.add_argument("--cookies", action="store_true",
+                   help="send random Cookie headers (off by default: cold browsers have none)")
+    h.add_argument("--buster", action="store_true",
+                   help="append random cache-buster query params (off by default)")
     h.add_argument("--retries", type=int, default=0, help="retries per request on transport error")
     h.add_argument("--retry-backoff", type=float, default=0.1)
 
@@ -163,8 +165,8 @@ def main(argv: list[str] | None = None) -> int:
                 body=args.body.encode(),
                 randomize_ua=not args.no_random_ua,
                 strategy=args.payload,
-                cookies=not args.no_cookies,
-                query_buster=not args.no_buster,
+                cookies=args.cookies,
+                query_buster=args.buster,
                 max_retries=args.retries,
                 retry_backoff=args.retry_backoff,
                 http2=args.http2,

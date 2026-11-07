@@ -26,8 +26,8 @@ class HttpProfile:
     randomize_ua: bool = True
     keepalive: bool = True
     strategy: str = PayloadStrategy.BROWSER
-    cookies: bool = True
-    query_buster: bool = True
+    cookies: bool = False
+    query_buster: bool = False
     max_retries: int = 0
     retry_backoff: float = 0.1
     http2: bool = False

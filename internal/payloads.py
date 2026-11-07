@@ -1,4 +1,10 @@
-﻿"""Payload generators - evasion profiles and body/cookie variation."""
+﻿"""Payload generators - evasion profiles and body/cookie variation.
+
+Header sets are modelled on what a *real* browser sends on a cold first
+navigation, because the impossible combinations (random cookies on a never-
+visited domain, Sec-Fetch-Site: same-origin with no Referer, JSON Accept on
+a document request) are exactly what bot-management scores on.
+"""
 from __future__ import annotations
 
 import random
@@ -17,14 +23,15 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
 ]
 
-ACCEPT_POOL = [
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "application/json, text/plain, */*",
-    "*/*",
-]
+# must match the UA that was picked - Chrome UAs want Sec-Fetch + CH headers,
+# Firefox and Safari send a different set entirely
+ACCEPT_NAV = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+ACCEPT_NAV_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+ACCEPT_JSON = "application/json, text/plain, */*"
 
-ENCODING_POOL = ["gzip, deflate, br", "gzip, deflate", "gzip, deflate, br, zstd"]
+ENC_CHROME = "gzip, deflate, br, zstd"
+ENC_FIREFOX = "gzip, deflate, br"
+ENC_SAFARI = "gzip, deflate, br"
 
 LANG_POOL = [
     "en-US,en;q=0.9",
@@ -38,38 +45,78 @@ def rand_token(n: int = 12, alphabet: str = string.ascii_letters + string.digits
     return "".join(random.choices(alphabet, k=n))
 
 
-def browser_headers(host: str, method: str = "GET", accept_json: bool = False) -> dict[str, str]:
-    """Full realistic browser header set with per-call randomization."""
-    h = {
+def _ua_family(ua: str) -> str:
+    if "Firefox" in ua:
+        return "firefox"
+    if "Edg/" in ua:
+        return "edge"
+    if "Chrome" in ua and "Safari" in ua:
+        return "chrome"
+    if "Safari" in ua:
+        return "safari"
+    return "chrome"
+
+
+def browser_headers(
+    host: str,
+    method: str = "GET",
+    accept_json: bool = False,
+    navigation: bool = True,
+    with_cookies: bool = False,
+) -> dict[str, str]:
+    """Header set for a cold first navigation.
+
+    navigation=True models the first hit on a site: Sec-Fetch-Site is `none`,
+    no Referer, no cookies unless explicitly requested. That is the shape a
+    real browser produces and the one bot management expects.
+    """
+    ua = random.choice(UA_POOL)
+    family = _ua_family(ua)
+    lang = random.choice(LANG_POOL)
+
+    h: dict[str, str] = {
         "Host": host,
-        "User-Agent": random.choice(UA_POOL),
-        "Accept": random.choice(ACCEPT_POOL) if not accept_json else "application/json, text/plain, */*",
-        "Accept-Language": random.choice(LANG_POOL),
-        "Accept-Encoding": random.choice(ENCODING_POOL),
-        "Cache-Control": random.choice(["no-cache", "max-age=0", "no-store"]),
-        "Pragma": "no-cache",
-        "Sec-Fetch-Dest": random.choice(["document", "empty", "script"]),
-        "Sec-Fetch-Mode": random.choice(["navigate", "cors", "no-cors"]),
-        "Sec-Fetch-Site": random.choice(["none", "same-origin", "cross-site"]),
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": ua,
+        "Accept": ACCEPT_JSON if accept_json else (
+            ACCEPT_NAV_FIREFOX if family == "firefox" else ACCEPT_NAV),
+        "Accept-Language": lang,
+        "Accept-Encoding": ENC_FIREFOX if family == "firefox" else (
+            ENC_SAFARI if family == "safari" else ENC_CHROME),
         "Connection": "keep-alive",
-        "DNT": random.choice(["1", "0"]),
     }
-    if "Chrome" in h["User-Agent"]:
-        h["sec-ch-ua"] = '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"'
-        h["sec-ch-ua-mobile"] = "?0"
-        h["sec-ch-ua-platform"] = '"Windows"' if "Windows" in h["User-Agent"] else '"macOS"'
-    if method in ("POST", "PUT", "PATCH"):
+
+    if navigation:
+        h["Upgrade-Insecure-Requests"] = "1"
+        h["Sec-Fetch-Dest"] = "document"
+        h["Sec-Fetch-Mode"] = "navigate"
+        h["Sec-Fetch-Site"] = "none"
+        h["Sec-Fetch-User"] = "?1"
+
+    if family in ("chrome", "edge"):
+        brand = '"Microsoft Edge";v="131"' if family == "edge" else '"Google Chrome";v="131"'
+        h["sec-ch-ua"] = f'"Chromium";v="131", "Not_A Brand";v="24", {brand}'
+        h["sec-ch-ua-mobile"] = "?1" if any(x in ua for x in ("Android", "iPhone")) else "?0"
+        h["sec-ch-ua-platform"] = (
+            '"Windows"' if "Windows" in ua else
+            '"macOS"' if "Macintosh" in ua else
+            '"Android"' if "Android" in ua else
+            '"iOS"' if "iPhone" in ua or "iPad" in ua else '"Linux"')
+
+    if with_cookies:
+        h["Cookie"] = random_cookies()
+
+    if method in ("POST", "PUT", "PATCH") and not accept_json:
         h["Origin"] = f"https://{host}"
         h["Referer"] = f"https://{host}/"
+        h["Sec-Fetch-Site"] = "same-origin"
+
     return h
 
 
 def random_query(n: int = 4) -> str:
-    """Cache-buster query string with random key/value pairs."""
-    pairs = [f"{rand_token(5, string.ascii_lowercase)}{i}={rand_token(10)}" for i in range(n)]
-    return "&".join(pairs)
+    return "&".join(
+        f"{rand_token(6, string.ascii_lowercase)}{i}={rand_token(10)}" for i in range(n)
+    )
 
 
 def random_cookies(n: int = 3) -> str:
@@ -98,24 +145,39 @@ def multipart_body(boundary: str | None = None) -> bytes:
 
 
 class PayloadStrategy:
-    """Decides per-request header/body/cookie variation."""
+    """Decides per-request header/body/cookie variation.
+
+    Defaults are intentionally conservative: a cold-navigation browser shape
+    with no cookies. Aggressive variation is opt-in.
+    """
     BROWSER = "browser"
     JSON = "json"
     FORM = "form"
     RANDOM = "random"
 
-    def __init__(self, strategy: str = BROWSER, method: str = "GET",
-                 cookies: bool = True, query_buster: bool = True) -> None:
+    def __init__(
+        self,
+        strategy: str = BROWSER,
+        method: str = "GET",
+        cookies: bool = False,
+        query_buster: bool = False,
+        warm: bool = False,
+    ) -> None:
         self.strategy = strategy
         self.method = method
         self.cookies = cookies
         self.query_buster = query_buster
+        self.warm = warm
 
     def headers(self, host: str) -> dict[str, str]:
-        h = browser_headers(host, self.method, accept_json=self.strategy == self.JSON)
-        if self.cookies:
-            h["Cookie"] = random_cookies()
-        return h
+        is_json = self.strategy == self.JSON
+        navigation = not is_json
+        return browser_headers(
+            host, self.method,
+            accept_json=is_json,
+            navigation=navigation,
+            with_cookies=self.cookies,
+        )
 
     def body(self) -> tuple[bytes, str | None]:
         strategy = self.strategy
