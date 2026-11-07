@@ -25,7 +25,7 @@ BANNER = r"""
 | |/ _ \ / _` |/ _` | |/ _` |/ _` |
 | | (_) | (_| | (_| | | (_| | (_| |
 |_|\___/ \__,_|\__,_|_|\__,_|\__,_|
-   load and packet-rate harness   v1.1
+   load and packet-rate harness   v1.2
 """
 
 
@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--proxy-strategy", default="weighted",
                    choices=["weighted", "round_robin", "random", "least_used"])
 
+    h.add_argument("--http2", action="store_true",
+                   help="speak real HTTP/2 framing (ALPN h2, HPACK, multiplexed streams)")
     h.add_argument("--payload", default=PayloadStrategy.BROWSER,
                    choices=[PayloadStrategy.BROWSER, PayloadStrategy.JSON,
                             PayloadStrategy.FORM, PayloadStrategy.RANDOM],
@@ -141,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     ui.start()
 
     meta = {"target": target.original, "resolved": target.resolved, "mode": args.cmd}
+    if args.cmd == "http":
+        meta["http2"] = bool(args.http2)
     try:
         if args.cmd == "http":
             proxy_pool = None
@@ -163,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
                 query_buster=not args.no_buster,
                 max_retries=args.retries,
                 retry_backoff=args.retry_backoff,
+                http2=args.http2,
             )
             scenario = _build_scenario(args)
             if scenario:
