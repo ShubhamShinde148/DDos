@@ -1,21 +1,19 @@
-﻿"""HTTP/1.1 + HTTP/2 request storm engine with rate shaping."""
+﻿"""HTTP/1.1 + HTTP/2 request storm engine with rate shaping, scenarios,
+proxy rotation, adaptive control, retries and per-connection tracking."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import random
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .adaptive import AdaptiveController
 from .metrics import Metrics
+from .payloads import PayloadStrategy
+from .proxypool import Proxy, ProxyPool
 from .scope import Target
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-]
 
 
 @dataclass
@@ -24,26 +22,64 @@ class HttpProfile:
     headers: tuple[tuple[str, str], ...] = ()
     body: bytes = b""
     randomize_ua: bool = True
-    http2: bool = False
     keepalive: bool = True
+    strategy: str = PayloadStrategy.BROWSER
+    cookies: bool = True
+    query_buster: bool = True
+    max_retries: int = 0
+    retry_backoff: float = 0.1
 
-    def build_headers(self, target: Target) -> dict[str, str]:
-        base = {
-            "Host": target.netloc,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive" if self.keepalive else "close",
+
+class RateLimiter:
+    """Token bucket, resizable at runtime by the scenario director / adaptive."""
+
+    def __init__(self, rps: int | None) -> None:
+        self.cap = float(rps) if rps else 0.0
+        self.tokens = float(rps) if rps else 0.0
+        self.last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def set_cap(self, rps: int | None) -> None:
+        new_cap = float(rps) if rps else 0.0
+        if new_cap == self.cap:
+            return
+        self.cap = new_cap
+        self.tokens = min(self.tokens, new_cap) if new_cap else 0.0
+        self.last = time.monotonic()
+
+    async def acquire(self) -> None:
+        if not self.cap:
+            return
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.cap, self.tokens + (now - self.last) * self.cap)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                await asyncio.sleep((1.0 - self.tokens) / self.cap)
+
+
+@dataclass
+class ConnStats:
+    opened: int = 0
+    reused: int = 0
+    closed: int = 0
+    refused: int = 0
+    timeouts: int = 0
+    resets: int = 0
+    tls_errors: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "opened": self.opened, "reused": self.reused, "closed": self.closed,
+            "refused": self.refused, "timeouts": self.timeouts,
+            "resets": self.resets, "tls_errors": self.tls_errors,
         }
-        base["User-Agent"] = random.choice(USER_AGENTS) if self.randomize_ua else USER_AGENTS[0]
-        for k, v in self.headers:
-            base[k] = v
-        return base
 
 
 class HttpFlooder:
-    """asyncio keep-alive storm with a token-bucket RPS limiter."""
-
     def __init__(
         self,
         target: Target,
@@ -53,42 +89,35 @@ class HttpFlooder:
         duration: float = 30.0,
         profile: HttpProfile | None = None,
         per_conn_requests: int = 50,
+        proxy_pool: ProxyPool | None = None,
+        adaptive: AdaptiveController | None = None,
+        scenario=None,
+        timeout: float = 8.0,
     ) -> None:
         self.target = target
         self.metrics = metrics
         self.concurrency = concurrency
-        self.rps_limit = rps_limit
+        self.limiter = RateLimiter(rps_limit)
         self.duration = duration
         self.profile = profile or HttpProfile()
         self.per_conn_requests = max(1, per_conn_requests)
+        self.proxy_pool = proxy_pool
+        self.adaptive = adaptive
+        self.scenario = scenario
+        self.timeout = timeout
+        self.conn_stats = ConnStats()
         self._stop = asyncio.Event()
-        self._tokens = float(rps_limit) if rps_limit else 0.0
-        self._last_refill = time.monotonic()
-        self._rate_lock = asyncio.Lock()
+        self._stopped_at: float | None = None
+        self._payload = PayloadStrategy(
+            strategy=self.profile.strategy,
+            method=self.profile.method,
+            cookies=self.profile.cookies,
+            query_buster=self.profile.query_buster,
+        )
 
-    async def _acquire(self) -> None:
-        if not self.rps_limit:
-            return
-        async with self._rate_lock:
-            now = time.monotonic()
-            self._tokens = min(
-                float(self.rps_limit),
-                self._tokens + (now - self._last_refill) * self.rps_limit,
-            )
-            self._last_refill = now
-            if self._tokens < 1.0:
-                await self._rate_lock.release()
-                try:
-                    await asyncio.sleep((1.0 - self._tokens) / self.rps_limit)
-                finally:
-                    await self._rate_lock.acquire()
-                now = time.monotonic()
-                self._tokens = min(
-                    float(self.rps_limit),
-                    self._tokens + (now - self._last_refill) * self.rps_limit,
-                )
-                self._last_refill = now
-            self._tokens -= 1.0
+    def force_stop(self) -> None:
+        self._stopped_at = time.monotonic()
+        self._stop.set()
 
     def _ssl_ctx(self) -> ssl.SSLContext | None:
         if self.target.scheme != "https":
@@ -102,78 +131,153 @@ class HttpFlooder:
             pass
         return ctx
 
-    async def _timed_stop(self) -> None:
-        await asyncio.sleep(self.duration)
-        self._stop.set()
+    async def _open(self, proxy: Proxy | None, ssl_ctx) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if proxy is None:
+            return await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.target.host, self.target.port, ssl=ssl_ctx,
+                    server_hostname=self.target.host if ssl_ctx else None,
+                    limit=65536,
+                ),
+                timeout=self.timeout,
+            )
 
-    async def worker(self, wid: int) -> None:
-        headers = self.profile.build_headers(self.target)
-        hdr_blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        if self.profile.body:
-            hdr_blob += f"Content-Length: {len(self.profile.body)}\r\n"
-        request = f"{self.profile.method} {self.target.path} HTTP/1.1\r\n{hdr_blob}\r\n".encode() + self.profile.body
+        # HTTP CONNECT tunnel through the proxy, then TLS inside if needed
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy.host, proxy.port, limit=65536),
+            timeout=self.timeout,
+        )
+        dest = f"{self.target.host}:{self.target.port}"
+        req = f"CONNECT {dest} HTTP/1.1\r\nHost: {dest}\r\n"
+        if proxy.username:
+            cred = base64.b64encode(f"{proxy.username}:{proxy.password}".encode()).decode()
+            req += f"Proxy-Authorization: Basic {cred}\r\n"
+        req += "\r\n"
+        writer.write(req.encode())
+        await asyncio.wait_for(writer.drain(), timeout=self.timeout)
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=self.timeout)
+        if b" 200 " not in head.split(b"\r\n", 1)[0] + b" ":
+            raise ConnectionError(f"proxy CONNECT rejected: {head.split(b'\r\n',1)[0]!r}")
+        return reader, writer
 
-        while not self._stop.is_set():
-            wrote_conn = False
+    def _build_request(self) -> tuple[bytes, bool]:
+        p = self.profile
+        use_headers = self._payload.headers(self.target.netloc) if p.randomize_ua else {
+            "Host": self.target.netloc,
+            "User-Agent": "loadlab/1.1",
+            "Connection": "keep-alive" if p.keepalive else "close",
+        }
+        body, ctype = (p.body, None)
+        if not body and p.strategy != PayloadStrategy.BROWSER:
+            body, ctype = self._payload.body()
+        if ctype:
+            use_headers["Content-Type"] = ctype
+        for k, v in p.headers:
+            use_headers[k] = v
+
+        path = self._payload.path(self.target.path, p.method == "GET")
+        hdr = "".join(f"{k}: {v}\r\n" for k, v in use_headers.items())
+        if body:
+            hdr += f"Content-Length: {len(body)}\r\n"
+        line = f"{p.method} {path} HTTP/1.1\r\n{hdr}\r\n".encode()
+        return line + body, use_headers.get("Connection") == "close"
+
+    async def _one_request(self, writer, reader) -> tuple[bool, int]:
+        request, close_after = self._build_request()
+        start = time.perf_counter()
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=self.timeout)
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=self.timeout)
+
+        first = head.split(b"\r\n", 1)[0]
+        try:
+            status = int(first.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            status = 0
+        size = len(head)
+        clen = 0
+        for line in head.split(b"\r\n")[1:]:
+            low = line.lower()
+            if low.startswith(b"content-length:"):
+                try:
+                    clen = int(line.split(b":", 1)[1].strip())
+                except ValueError:
+                    clen = 0
+                break
+        if clen:
+            remaining = min(clen, 1 << 20)
+            while remaining > 0:
+                chunk = await asyncio.wait_for(reader.read(min(remaining, 65536)), timeout=self.timeout)
+                if not chunk:
+                    break
+                size += len(chunk)
+                remaining -= len(chunk)
+        self.metrics.record(status, time.perf_counter() - start, size)
+        return True, status
+
+    async def worker(self, wid: int, stop: asyncio.Event | None = None) -> None:
+        stop = stop or self._stop
+        ssl_ctx = self._ssl_ctx()
+        while not stop.is_set() and not self._stop.is_set():
+            proxy = self.proxy_pool.acquire() if self.proxy_pool else None
+            reader = writer = None
+            opened = False
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        self.target.host,
-                        self.target.port,
-                        ssl=self._ssl_ctx(),
-                        server_hostname=self.target.host if self.target.scheme == "https" else None,
-                        limit=65536,
-                    ),
-                    timeout=8.0,
-                )
+                reader, writer = await self._open(proxy, ssl_ctx)
+                self.conn_stats.opened += 1
                 self.metrics.open_connections += 1
-                wrote_conn = True
+                opened = True
+                if proxy:
+                    proxy.mark_success()
 
                 for _ in range(self.per_conn_requests):
-                    if self._stop.is_set():
+                    if stop.is_set() or self._stop.is_set():
                         break
-                    await self._acquire()
+                    await self.limiter.acquire()
+                    if self.adaptive is not None:
+                        self.limiter.set_cap(self.adaptive.tick(self.metrics.snapshot()))
                     self.metrics.inflight += 1
-                    start = time.perf_counter()
+                    attempt = 0
                     try:
-                        writer.write(request)
-                        await asyncio.wait_for(writer.drain(), timeout=8.0)
-                        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=8.0)
-                        status_line = head.split(b"\r\n", 1)[0]
-                        try:
-                            status = int(status_line.split(b" ", 2)[1])
-                        except (IndexError, ValueError):
-                            status = 0
-                        size = len(head)
-                        clen = 0
-                        for line in head.split(b"\r\n")[1:]:
-                            if line.lower().startswith(b"content-length:"):
-                                try:
-                                    clen = int(line.split(b":", 1)[1].strip())
-                                except ValueError:
-                                    clen = 0
+                        while True:
+                            try:
+                                ok, _ = await self._one_request(writer, reader)
                                 break
-                        if clen:
-                            size += len(await asyncio.wait_for(reader.read(min(clen, 1 << 20)), timeout=8.0))
-                        latency = time.perf_counter() - start
-                        self.metrics.record(status, latency, size)
-                        if headers.get("Connection") == "close":
-                            break
+                            except (ConnectionError, OSError) as exc:
+                                attempt += 1
+                                if attempt > self.profile.max_retries:
+                                    raise
+                                self.metrics.record_error(f"retry:{type(exc).__name__}")
+                                await asyncio.sleep(self.profile.retry_backoff * attempt)
+                                reader, writer = await self._open(proxy, ssl_ctx)
                     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
-                        self.metrics.record_error(type(exc).__name__, time.perf_counter() - start)
+                        self.metrics.record_error(type(exc).__name__)
+                        name = type(exc).__name__
+                        if isinstance(exc, ConnectionRefusedError):
+                            self.conn_stats.refused += 1
+                        elif isinstance(exc, asyncio.TimeoutError):
+                            self.conn_stats.timeouts += 1
+                        elif isinstance(exc, ssl.SSLError):
+                            self.conn_stats.tls_errors += 1
+                        elif isinstance(exc, ConnectionResetError):
+                            self.conn_stats.resets += 1
+                        if proxy and name not in ("IncompleteReadError",):
+                            proxy.mark_failure()
                         break
                     except asyncio.CancelledError:
                         raise
                     except RuntimeError:
                         break
                     except Exception as exc:
-                        self.metrics.record_error(type(exc).__name__, time.perf_counter() - start)
+                        self.metrics.record_error(type(exc).__name__)
                         break
                     finally:
                         self.metrics.inflight -= 1
             except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
                 self.metrics.record_error(type(exc).__name__)
                 self.metrics.reconnects += 1
+                if proxy:
+                    proxy.mark_failure()
                 await asyncio.sleep(0.02)
             except asyncio.CancelledError:
                 raise
@@ -185,7 +289,8 @@ class HttpFlooder:
                 self.metrics.reconnects += 1
                 await asyncio.sleep(0.02)
             finally:
-                if wrote_conn:
+                if opened:
+                    self.conn_stats.closed += 1
                     self.metrics.open_connections -= 1
                     self.metrics.reconnects += 1
                     try:
@@ -198,13 +303,35 @@ class HttpFlooder:
                             ConnectionError, OSError, RuntimeError):
                         pass
 
+    async def _timed_stop(self, duration: float) -> None:
+        await asyncio.sleep(duration)
+        self.force_stop()
+
     async def run(self) -> None:
-        stop_task = asyncio.create_task(self._timed_stop())
+        from .scenario import StageDirector
+
+        if self.scenario is not None:
+            director = StageDirector(self.scenario, self.metrics)
+            self._director = director
+
+            async def factory(wid, stop):
+                self.concurrency = director._target_conns or self.concurrency
+                self.limiter.set_cap(director.metrics.rps_cap)
+                await self.worker(wid, stop)
+
+            timer = asyncio.create_task(self._timed_stop(self.duration))
+            try:
+                await director.run(factory)
+            finally:
+                timer.cancel()
+            return
+
+        stop_task = asyncio.create_task(self._timed_stop(self.duration))
         try:
-            await asyncio.gather(*(self.worker(i) for i in range(self.concurrency)), return_exceptions=True)
+            await asyncio.gather(
+                *(self.worker(i) for i in range(self.concurrency)),
+                return_exceptions=True,
+            )
         finally:
             stop_task.cancel()
             self._stop.set()
-
-
-
